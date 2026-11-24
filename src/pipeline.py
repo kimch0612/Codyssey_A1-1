@@ -5,6 +5,7 @@
 차트는 노트북(notebooks/analysis_report.ipynb)에서 그린다.
 """
 
+import datetime
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
@@ -473,6 +474,91 @@ class DataAnalyzer:
             "days_in_month", "is_partial", "daily_avg",
         ]
         return result.reset_index(drop=True)[columns]
+
+    def calculate_rfm(
+        self,
+        table: str = "transactions",
+        customer_col: str = "customer_id",
+        date_col: str = "order_date",
+        amount_col: str = "amount",
+        reference_date: Optional[Union[str, datetime.date, pd.Timestamp]] = None,
+    ) -> pd.DataFrame:
+        """고객별 Recency(최근성), Frequency(빈도), Monetary(금액)를 계산한다.
+
+        - Recency: 기준일에서 그 고객의 마지막 구매일까지 지난 날수(정수). 작을수록 최근에
+          구매한 것이다. 기준일에 구매한 고객은 0이다.
+        - Frequency: 서로 다른 구매일의 수. 같은 날 여러 상품을 사도 한 번으로 센다.
+        - Monetary: 금액의 합계.
+
+        고객 ID나 날짜가 비어 있는 행은 계산에서 제외한다. 금액이 비어 있는 행은 구매일로는
+        세고 금액 합계에는 더하지 않는다(0). 계산은 새 표를 만들어 반환하며 테이블을
+        바꾸지 않는다.
+
+        Args:
+            table: 거래 테이블 이름.
+            customer_col: 고객 ID 컬럼.
+            date_col: 날짜형 구매일 컬럼.
+            amount_col: 숫자형 금액 컬럼.
+            reference_date: Recency의 기준일. 문자열("2020-09-22"), 날짜, Timestamp를
+                받는다. None이면 테이블의 마지막 구매일이다.
+
+        Returns:
+            고객당 한 행의 DataFrame(고객 ID 순). 컬럼은 `customer_col`의 이름,
+            `recency`, `frequency`, `monetary`다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table이거나, 기준일을 날짜로 해석할 수 없거나, 기준일이
+                어느 고객의 마지막 구매일보다 이를 때.
+            TypeError: 날짜 컬럼이 날짜형이 아니거나 금액 컬럼이 숫자형이 아니거나,
+                기준일이 문자열·날짜·Timestamp가 아닐 때.
+        """
+        df = self._get_table(table)
+        customers, dates, amounts = df[customer_col], df[date_col], df[amount_col]
+        if not pd.api.types.is_datetime64_any_dtype(dates):
+            raise TypeError(f"날짜형 컬럼이어야 한다: {date_col!r} ({dates.dtype})")
+        if not pd.api.types.is_numeric_dtype(amounts):
+            raise TypeError(f"숫자형 컬럼이어야 한다: {amount_col!r} ({amounts.dtype})")
+
+        valid = customers.notna() & dates.notna()
+        orders = pd.DataFrame(
+            {
+                "customer": customers[valid],
+                "day": dates[valid].dt.normalize(),  # 시각을 버리고 날짜만 남긴다.
+                "amount": amounts[valid],
+            }
+        )
+        grouped = orders.groupby("customer")
+        last_day = grouped["day"].max()  # 고객별 마지막 구매일
+
+        if reference_date is None:
+            reference = orders["day"].max()
+        else:
+            if not isinstance(reference_date, (str, datetime.date, pd.Timestamp)):
+                raise TypeError(
+                    f"기준일은 문자열·날짜·Timestamp여야 한다: {reference_date!r}"
+                )
+            try:
+                reference = pd.Timestamp(reference_date)
+            except ValueError as error:
+                raise ValueError(f"기준일을 날짜로 해석할 수 없다: {reference_date!r}") from error
+            if pd.isna(reference):  # pd.NaT도 날짜 객체로 취급되므로 따로 막는다.
+                raise ValueError(f"기준일을 날짜로 해석할 수 없다: {reference_date!r}")
+            reference = reference.normalize()  # 시각을 버리고 날짜만 남긴다.
+            if len(last_day) > 0 and reference < last_day.max():
+                raise ValueError(
+                    f"기준일({reference.date()})이 마지막 구매일({last_day.max().date()})보다 "
+                    "이르다. 기준일은 모든 고객의 마지막 구매일 이후여야 한다."
+                )
+
+        return pd.DataFrame(
+            {
+                customer_col: last_day.index,
+                "recency": (reference - last_day).dt.days.to_numpy(),
+                "frequency": grouped["day"].nunique().to_numpy(),
+                "monetary": grouped["amount"].sum().to_numpy(),
+            }
+        )
 
     def _numeric_data(
         self, table: str, columns: Sequence[str], minimum: int
