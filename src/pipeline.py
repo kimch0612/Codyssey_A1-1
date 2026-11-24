@@ -6,9 +6,11 @@
 """
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
+from matplotlib.image import imread
 
 
 class DataAnalyzer:
@@ -126,3 +128,57 @@ class DataAnalyzer:
         self.articles[f"{text_col}_word_count"] = text.str.split().str.len()
         self.articles[f"{text_col}_length"] = text.str.len()
         return self
+
+    def add_image_features(
+        self, image_col: str = "image_path", step: int = 1
+    ) -> "DataAnalyzer":
+        """상품 이미지에서 평균(Mean)과 표준편차(Std)를 계산해 새 컬럼으로 추가한다.
+
+        추가되는 컬럼(원본 컬럼은 바꾸지 않는다):
+            - `img_mean`: 이미지의 모든 값(세로·가로·채널 전부)의 평균. 밝기에 해당한다.
+            - `img_std`: 이미지의 모든 값의 표준편차(모집단, ddof=0). 밝고 어두운
+              부분의 차이(대비)에 해당한다.
+
+        이미지는 `matplotlib.image.imread()`로 읽어 NumPy 배열로 만든다. 파일을 여는
+        반복은 파일마다 한 번씩 필요하지만, 이미지 한 장 안의 픽셀 계산(평균·표준편차)은
+        반복문 없이 NumPy 배열 연산으로 한 번에 한다. 이미지는 크기가 서로 달라도
+        한 장씩 계산하므로 크기를 맞추지 않으며, 한꺼번에 쌓지도 않는다.
+        이미지 경로가 비어 있는 상품은 두 컬럼도 결측으로 남긴다.
+
+        Args:
+            image_col: 이미지 파일 경로 컬럼. 경로는 `data_dir` 기준 상대 경로다.
+            step: 다운샘플링 간격. 1이면 전체 해상도를 쓰고, 1보다 크면
+                `arr[::step, ::step]` 슬라이싱으로 픽셀을 건너뛰어 계산한다.
+
+        Returns:
+            self. 다시 호출하면 두 컬럼을 덮어쓴다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: `step`이 1 이상의 정수가 아닐 때.
+            FileNotFoundError: 경로에 해당하는 이미지 파일이 없을 때.
+        """
+        if self.articles is None:
+            raise RuntimeError("load_data()를 먼저 호출해야 한다.")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+            raise ValueError(f"step은 1 이상의 정수여야 한다: {step!r}")
+
+        has_image = self.articles[image_col].notna()
+        # 파일을 여는 반복은 파일 수만큼 필요하다.
+        stats = [
+            self._image_mean_std(self.data_dir / path, step)
+            for path in self.articles.loc[has_image, image_col]
+        ]
+
+        self.articles["img_mean"] = np.nan
+        self.articles["img_std"] = np.nan
+        if stats:
+            self.articles.loc[has_image, ["img_mean", "img_std"]] = np.array(stats)
+        return self
+
+    @staticmethod
+    def _image_mean_std(path: Path, step: int) -> Tuple[float, float]:
+        """이미지 한 장을 읽어 (평균, 표준편차)를 반환한다."""
+        image = imread(str(path))  # 모양 (세로, 가로, 채널), 자료형 uint8, 값 0~255
+        pixels = image[::step, ::step]  # step=1이면 전체
+        return pixels.mean(), pixels.std()  # 모든 값에 대한 배열 연산(반복문 없음)
