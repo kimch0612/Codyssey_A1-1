@@ -45,6 +45,9 @@ class DataAnalyzer:
     # 상관계수 계산 방법: 피어슨(값 자체), 스피어만(값의 순위)
     CORRELATION_METHODS = ("pearson", "spearman")
 
+    # RFM 세그먼트 이름(보고서와 차트에 쓰는 순서). 분류 규칙은 `segment_customers()`에 있다.
+    SEGMENT_ORDER = ("VIP", "Loyal", "New", "At Risk", "Cooling", "Churned")
+
     def __init__(self, data_dir: Optional[Union[str, Path]] = None):
         """분석기를 만든다. 데이터는 `load_data()`를 호출할 때 읽는다.
 
@@ -559,6 +562,154 @@ class DataAnalyzer:
                 "monetary": grouped["amount"].sum().to_numpy(),
             }
         )
+
+    def score_rfm(
+        self,
+        rfm: pd.DataFrame,
+        n_bins: int = 5,
+        frequency_edges: Sequence[float] = (1, 2, 4, 9),
+    ) -> pd.DataFrame:
+        """RFM 값을 1~`n_bins`점으로 바꾼다. 점수가 높을수록 좋은 고객이다.
+
+        - Recency, Monetary: 값을 같은 인원씩 `n_bins`구간으로 나눈(분위수) 점수.
+          Recency는 작을수록 좋으므로 가장 최근 구간이 최고점이다.
+        - Frequency: 같은 값이 많아(구매일 1일뿐인 고객이 많다) 분위수 경계가 겹치므로
+          `frequency_edges`로 직접 나눈다. 경계 이하의 값이 해당 구간이다. 기본값
+          (1, 2, 4, 9)는 구매일 수 1 / 2 / 3~4 / 5~9 / 10 이상을 1~5점으로 한다.
+
+        Args:
+            rfm: `calculate_rfm()`의 결과(`recency`, `frequency`, `monetary` 컬럼).
+            n_bins: 점수 단계 수(2 이상). 분위수 구간 수이기도 하다.
+            frequency_edges: Frequency 구간 경계. 오름차순이어야 하고 길이가
+                `n_bins - 1`이어야 한다.
+
+        Returns:
+            입력에 `r_score`, `f_score`, `m_score`(정수) 컬럼을 추가한 새 표. 입력은 바뀌지 않는다.
+
+        Raises:
+            TypeError: rfm이 DataFrame이 아닐 때.
+            KeyError: 필요한 컬럼이 없을 때.
+            ValueError: n_bins·frequency_edges가 올바르지 않거나, 값이 비어 있거나,
+                분위수 경계가 겹쳐 구간을 만들 수 없을 때.
+        """
+        self._check_rfm_table(rfm, ("recency", "frequency", "monetary"))
+        if isinstance(n_bins, bool) or not isinstance(n_bins, int) or n_bins < 2:
+            raise ValueError(f"n_bins는 2 이상의 정수여야 한다: {n_bins!r}")
+        edges = list(frequency_edges)
+        if len(edges) != n_bins - 1:
+            raise ValueError(
+                f"frequency_edges는 {n_bins - 1}개여야 한다(n_bins={n_bins}): {edges!r}"
+            )
+        if any(b <= a for a, b in zip(edges, edges[1:])):
+            raise ValueError(f"frequency_edges는 오름차순이어야 한다: {edges!r}")
+
+        labels = list(range(1, n_bins + 1))
+        try:
+            r_bins = pd.qcut(rfm["recency"], n_bins, labels=labels[::-1])
+            m_bins = pd.qcut(rfm["monetary"], n_bins, labels=labels)
+        except ValueError as error:
+            raise ValueError(f"분위수 경계가 겹쳐 점수 구간을 만들 수 없다: {error}") from error
+        f_bins = pd.cut(rfm["frequency"], bins=[-np.inf] + edges + [np.inf], labels=labels)
+
+        scored = rfm.copy()
+        scored["r_score"] = r_bins.astype(int)
+        scored["f_score"] = f_bins.astype(int)
+        scored["m_score"] = m_bins.astype(int)
+        return scored
+
+    def segment_customers(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """R·F 점수(1~5)로 고객을 6개 세그먼트로 나눈다. 모든 고객은 정확히 한 곳에 속한다.
+
+        규칙은 위에서부터 차례로 적용한다.
+            1. VIP     : R >= 4 그리고 F >= 4  (최근에 오고 자주 오는 고객)
+            2. Loyal   : R >= 3 그리고 F >= 3  (꾸준히 오는 고객)
+            3. New     : R >= 4 그리고 F <= 2  (최근에 왔지만 방문이 적은 고객)
+            4. At Risk : R <= 2 그리고 F >= 3  (한때 자주 왔지만 최근 오지 않는 고객)
+            5. Cooling : R == 3                 (위에 안 걸린 고객: 최근성 중간, 방문 적음)
+            6. Churned : 나머지(R <= 2 그리고 F <= 2) (오래 오지 않고 방문도 적은 고객)
+
+        M 점수는 규칙에 쓰지 않는다(F와 정보가 겹친다). 세그먼트별 금액 차이를 확인하는 데 쓴다.
+
+        Args:
+            scored: `score_rfm()`의 결과(`r_score`, `f_score` 컬럼, 값은 1~5).
+
+        Returns:
+            입력에 `segment` 컬럼을 추가한 새 표. 입력은 바뀌지 않는다.
+
+        Raises:
+            TypeError: scored가 DataFrame이 아닐 때.
+            KeyError: 필요한 컬럼이 없을 때.
+            ValueError: 점수가 비어 있거나 1~5의 정수가 아닐 때.
+        """
+        self._check_rfm_table(scored, ("r_score", "f_score"))
+        r, f = scored["r_score"], scored["f_score"]
+        for name, score in (("r_score", r), ("f_score", f)):
+            if not (score.between(1, 5).all() and (score % 1 == 0).all()):
+                raise ValueError(f"{name}는 1~5의 정수여야 한다.")
+
+        conditions = [
+            (r >= 4) & (f >= 4),
+            (r >= 3) & (f >= 3),
+            (r >= 4) & (f <= 2),
+            (r <= 2) & (f >= 3),
+            r == 3,
+        ]
+        names = ["VIP", "Loyal", "New", "At Risk", "Cooling"]
+        result = scored.copy()
+        result["segment"] = np.select(conditions, names, default="Churned")
+        return result
+
+    def segment_summary(self, segmented: pd.DataFrame) -> pd.DataFrame:
+        """세그먼트별 고객 수, 평균 R·F·M, 금액 합계와 비중을 표로 반환한다.
+
+        고객이 없는 세그먼트도 `SEGMENT_ORDER` 순서대로 항상 포함한다(고객 수 0).
+
+        Args:
+            segmented: `segment_customers()`의 결과(`segment`, `recency`, `frequency`,
+                `monetary` 컬럼).
+
+        Returns:
+            컬럼 `segment`, `customers`(고객 수), `avg_recency`, `avg_frequency`,
+            `avg_monetary`, `total_monetary`(금액 합계), `customer_pct`(고객 비중 %),
+            `monetary_pct`(금액 비중 %)의 DataFrame.
+
+        Raises:
+            TypeError: segmented가 DataFrame이 아닐 때.
+            KeyError: 필요한 컬럼이 없을 때.
+            ValueError: 알 수 없는 세그먼트 이름이 있을 때.
+        """
+        self._check_rfm_table(segmented, ("segment", "recency", "frequency", "monetary"))
+        unknown = set(segmented["segment"].unique()) - set(self.SEGMENT_ORDER)
+        if unknown:
+            raise ValueError(f"알 수 없는 세그먼트: {sorted(unknown)}")
+
+        grouped = segmented.groupby("segment")
+        summary = pd.DataFrame(
+            {
+                "customers": grouped.size(),
+                "avg_recency": grouped["recency"].mean(),
+                "avg_frequency": grouped["frequency"].mean(),
+                "avg_monetary": grouped["monetary"].mean(),
+                "total_monetary": grouped["monetary"].sum(),
+            }
+        ).reindex(list(self.SEGMENT_ORDER))
+        summary["customers"] = summary["customers"].fillna(0).astype(int)
+        summary["total_monetary"] = summary["total_monetary"].fillna(0.0)
+        summary["customer_pct"] = summary["customers"] / len(segmented) * 100
+        summary["monetary_pct"] = summary["total_monetary"] / segmented["monetary"].sum() * 100
+        summary.index.name = "segment"
+        return summary.reset_index()
+
+    @staticmethod
+    def _check_rfm_table(table: pd.DataFrame, columns: Sequence[str]) -> None:
+        """RFM 표가 DataFrame이고 필요한 컬럼이 있으며 그 값이 비어 있지 않은지 확인한다."""
+        if not isinstance(table, pd.DataFrame):
+            raise TypeError(f"DataFrame이어야 한다: {type(table).__name__}")
+        missing = [name for name in columns if name not in table.columns]
+        if missing:
+            raise KeyError(f"필요한 컬럼이 없다: {missing}")
+        if table[list(columns)].isna().any().any():
+            raise ValueError(f"{list(columns)} 컬럼에 결측이 있다.")
 
     def _numeric_data(
         self, table: str, columns: Sequence[str], minimum: int
