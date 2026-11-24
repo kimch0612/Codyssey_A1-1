@@ -37,6 +37,10 @@ class DataAnalyzer:
     TRANSACTIONS_DATE_COLUMNS = ["order_date"]
     ARTICLES_DATE_COLUMNS = ["first_sold_date"]
 
+    # 테이블 이름과, 결측 대치에 쓸 수 있는 통계.
+    TABLE_NAMES = ("transactions", "customers", "articles")
+    MISSING_STRATEGIES = ("median", "mean")
+
     def __init__(self, data_dir: Optional[Union[str, Path]] = None):
         """분석기를 만든다. 데이터는 `load_data()`를 호출할 때 읽는다.
 
@@ -182,3 +186,93 @@ class DataAnalyzer:
         image = imread(str(path))  # 모양 (세로, 가로, 채널), 자료형 uint8, 값 0~255
         pixels = image[::step, ::step]  # step=1이면 전체
         return pixels.mean(), pixels.std()  # 모든 값에 대한 배열 연산(반복문 없음)
+
+    def missing_report(self) -> pd.DataFrame:
+        """세 테이블에서 결측이 있는 컬럼의 결측 개수와 비율(%)을 표로 반환한다.
+
+        Returns:
+            컬럼 `table`, `column`, `missing`(결측 개수), `missing_pct`(비율, %)로 이루어진
+            DataFrame. 결측이 없는 컬럼은 포함하지 않는다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+        """
+        frames = []
+        for name in self.TABLE_NAMES:
+            df = self._get_table(name)
+            missing = df.isna().sum()
+            missing = missing[missing > 0]
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "table": name,
+                        "column": missing.index,
+                        "missing": missing.to_numpy(),
+                        "missing_pct": (missing.to_numpy() / len(df) * 100).round(2),
+                    }
+                )
+            )
+        return pd.concat(frames, ignore_index=True)
+
+    def handle_missing_values(
+        self,
+        table: str,
+        target_col: str,
+        group_col: Optional[str] = None,
+        strategy: str = "median",
+    ) -> "DataAnalyzer":
+        """숫자 컬럼의 결측치를 그룹별(또는 전체) 통계로 대치한다.
+
+        - `group_col`을 주면 같은 그룹 안의 값으로 계산한 통계로 채운다(GroupBy).
+        - 그룹 값 자체가 결측이거나 그 그룹에 값이 하나도 없어 통계를 구할 수 없으면
+          컬럼 전체의 통계로 채운다.
+        - `group_col`이 None이면 컬럼 전체의 통계로 채운다.
+        - 컬럼 전체가 결측이라 통계를 구할 수 없으면 결측으로 남긴다.
+        - 원래 값이 있던 행은 바꾸지 않는다. 같은 컬럼을 그 자리에서 덮어쓰므로
+          대치 전 값이 필요하면 호출 전에 복사해 둔다.
+
+        Args:
+            table: 대상 테이블 이름. "transactions", "customers", "articles" 중 하나.
+            target_col: 결측을 채울 숫자 컬럼.
+            group_col: 그룹을 나누는 컬럼. None이면 그룹 없이 전체 통계를 쓴다.
+            strategy: 채울 통계. "median"(중앙값) 또는 "mean"(평균).
+
+        Returns:
+            self.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table 또는 strategy일 때.
+            TypeError: target_col이 숫자형이 아닐 때.
+        """
+        df = self._get_table(table)
+        if strategy not in self.MISSING_STRATEGIES:
+            raise ValueError(
+                f"strategy는 {self.MISSING_STRATEGIES} 중 하나여야 한다: {strategy!r}"
+            )
+        column = df[target_col]
+        if not pd.api.types.is_numeric_dtype(column):
+            raise TypeError(f"숫자형 컬럼만 대치할 수 있다: {target_col!r} ({column.dtype})")
+        if not column.isna().any():
+            return self  # 채울 값이 없다.
+
+        overall = column.agg(strategy)  # 결측을 뺀 전체 통계(전부 결측이면 NaN)
+        if group_col is None:
+            fill_values = overall
+        else:
+            # 그룹별 통계를 각 행에 붙인다. 그룹 값이 결측이거나 그룹에 값이 없으면
+            # NaN이 되므로 전체 통계로 대신한다.
+            fill_values = df.groupby(group_col)[target_col].transform(strategy)
+            fill_values = fill_values.fillna(overall)
+
+        df[target_col] = column.fillna(fill_values)
+        return self
+
+    def _get_table(self, name: str) -> pd.DataFrame:
+        """테이블 이름으로 DataFrame을 돌려준다. 읽기 전이거나 이름이 틀리면 오류를 낸다."""
+        if name not in self.TABLE_NAMES:
+            raise ValueError(f"table은 {self.TABLE_NAMES} 중 하나여야 한다: {name!r}")
+        df = getattr(self, name)
+        if df is None:
+            raise RuntimeError("load_data()를 먼저 호출해야 한다.")
+        return df
