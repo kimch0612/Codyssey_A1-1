@@ -331,7 +331,9 @@ class DataAnalyzer:
             이상치 행들의 DataFrame(원래 행 번호를 유지한다). 이상치가 없으면 빈 표다.
 
         Raises:
-            `iqr_bounds()`와 같다.
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table이거나 threshold가 0 이상의 유한한 수가 아닐 때.
+            TypeError: column이 숫자형이 아닐 때.
         """
         lower, upper = self.iqr_bounds(table, column, threshold)
         df = self._get_table(table)
@@ -355,7 +357,9 @@ class DataAnalyzer:
             self. 다시 호출하면 `{column}_clipped`를 덮어쓴다.
 
         Raises:
-            `iqr_bounds()`와 같다.
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table이거나 threshold가 0 이상의 유한한 수가 아닐 때.
+            TypeError: column이 숫자형이 아닐 때.
         """
         lower, upper = self.iqr_bounds(table, column, threshold)
         df = self._get_table(table)
