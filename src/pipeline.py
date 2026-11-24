@@ -6,7 +6,7 @@
 """
 
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,9 @@ class DataAnalyzer:
     # 테이블 이름과, 결측 대치에 쓸 수 있는 통계.
     TABLE_NAMES = ("transactions", "customers", "articles")
     MISSING_STRATEGIES = ("median", "mean")
+
+    # 상관계수 계산 방법: 피어슨(값 자체), 스피어만(값의 순위)
+    CORRELATION_METHODS = ("pearson", "spearman")
 
     def __init__(self, data_dir: Optional[Union[str, Path]] = None):
         """분석기를 만든다. 데이터는 `load_data()`를 호출할 때 읽는다.
@@ -354,6 +357,135 @@ class DataAnalyzer:
         df = self._get_table(table)
         df[f"{column}_clipped"] = df[column].clip(lower=lower, upper=upper)
         return self
+
+    def summarize(self, table: str, columns: Sequence[str]) -> pd.DataFrame:
+        """숫자 컬럼들의 요약 통계(평균·중앙값·표준편차·사분위수 등)를 표로 반환한다.
+
+        결측은 계산에서 제외한다. 표준편차는 표본 표준편차(pandas 기본값, ddof=1)다.
+        번호 컬럼처럼 숫자로 저장돼 있지만 통계 의미가 없는 컬럼이 섞이지 않도록
+        `columns`를 반드시 직접 지정해야 한다.
+
+        Args:
+            table: 대상 테이블 이름. "transactions", "customers", "articles" 중 하나.
+            columns: 요약할 숫자 컬럼 이름들.
+
+        Returns:
+            컬럼 이름을 행으로 하고 `count`, `mean`, `median`, `std`, `min`, `q1`(25%),
+            `q3`(75%), `max`를 열로 하는 DataFrame.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table이거나 columns가 비어 있을 때.
+            TypeError: 숫자형이 아닌 컬럼이 있을 때.
+        """
+        data = self._numeric_data(table, columns, minimum=1)
+        return pd.DataFrame(
+            {
+                "count": data.count(),
+                "mean": data.mean(),
+                "median": data.median(),
+                "std": data.std(),
+                "min": data.min(),
+                "q1": data.quantile(0.25),
+                "q3": data.quantile(0.75),
+                "max": data.max(),
+            }
+        )
+
+    def correlation(
+        self, table: str, columns: Sequence[str], method: str = "pearson"
+    ) -> pd.DataFrame:
+        """숫자 컬럼들 사이의 상관행렬을 계산한다.
+
+        상관계수는 -1~1이며, 1에 가까우면 함께 커지고 -1에 가까우면 한쪽이 커질 때
+        다른 쪽이 작아지는 경향이다. 0에 가까우면 그런 경향이 약하다. 상관이 있다고
+        해서 한쪽이 다른 쪽의 원인이라는 뜻은 아니다. 결측이 있는 행은 해당 두 컬럼의
+        계산에서만 제외한다. 값이 모두 같은 컬럼은 결과가 결측이다.
+
+        Args:
+            table: 대상 테이블 이름.
+            columns: 숫자 컬럼 이름들(2개 이상).
+            method: "pearson"(값 자체의 직선 관계) 또는 "spearman"(값의 순위 사이 관계).
+                스피어만은 극단값의 영향을 덜 받는다.
+
+        Returns:
+            행과 열이 모두 `columns`인 대칭 DataFrame. 대각선은 1이다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table·method이거나 columns가 2개 미만일 때.
+            TypeError: 숫자형이 아닌 컬럼이 있을 때.
+        """
+        if method not in self.CORRELATION_METHODS:
+            raise ValueError(
+                f"method는 {self.CORRELATION_METHODS} 중 하나여야 한다: {method!r}"
+            )
+        data = self._numeric_data(table, columns, minimum=2)
+        return data.corr(method=method)
+
+    def monthly_sales(
+        self,
+        table: str = "transactions",
+        date_col: str = "order_date",
+        amount_col: str = "amount",
+    ) -> pd.DataFrame:
+        """거래를 월별로 집계해 건수와 매출 합계, 하루 평균 매출을 표로 반환한다.
+
+        데이터가 한 달의 일부 기간만 있으면 합계가 작게 보이므로, 데이터가 있는 날 수와
+        그 달의 일수를 함께 돌려주고 일부 기간만 있는 달을 표시한다.
+
+        Args:
+            table: 거래 테이블 이름.
+            date_col: 날짜형 컬럼.
+            amount_col: 금액 숫자 컬럼.
+
+        Returns:
+            월별 한 행의 DataFrame. 컬럼은 `month`(그 달 1일), `orders`(거래 행 수),
+            `total_amount`(금액 합계), `days`(데이터가 있는 날 수), `days_in_month`(그 달의
+            일수), `is_partial`(days < days_in_month), `daily_avg`(합계 / days).
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table일 때.
+            TypeError: date_col이 날짜형이 아니거나 amount_col이 숫자형이 아닐 때.
+        """
+        df = self._get_table(table)
+        dates, amounts = df[date_col], df[amount_col]
+        if not pd.api.types.is_datetime64_any_dtype(dates):
+            raise TypeError(f"날짜형 컬럼이어야 한다: {date_col!r} ({dates.dtype})")
+        if not pd.api.types.is_numeric_dtype(amounts):
+            raise TypeError(f"숫자형 컬럼이어야 한다: {amount_col!r} ({amounts.dtype})")
+
+        month = dates.dt.to_period("M")  # 날짜를 "2019-09" 같은 월 단위로 바꾼다.
+        result = pd.DataFrame(
+            {
+                "orders": amounts.groupby(month).size(),
+                "total_amount": amounts.groupby(month).sum(),
+                "days": dates.dt.normalize().groupby(month).nunique(),
+            }
+        )
+        result["month"] = result.index.to_timestamp()
+        result["days_in_month"] = result.index.days_in_month
+        result["is_partial"] = result["days"] < result["days_in_month"]
+        result["daily_avg"] = result["total_amount"] / result["days"]
+        columns = [
+            "month", "orders", "total_amount", "days",
+            "days_in_month", "is_partial", "daily_avg",
+        ]
+        return result.reset_index(drop=True)[columns]
+
+    def _numeric_data(
+        self, table: str, columns: Sequence[str], minimum: int
+    ) -> pd.DataFrame:
+        """테이블에서 숫자 컬럼들만 골라 반환한다. 컬럼이 부족하거나 숫자형이 아니면 오류를 낸다."""
+        df = self._get_table(table)
+        names = [columns] if isinstance(columns, str) else list(columns)
+        if len(names) < minimum:
+            raise ValueError(f"컬럼을 {minimum}개 이상 지정해야 한다: {names!r}")
+        for name in names:
+            if not pd.api.types.is_numeric_dtype(df[name]):
+                raise TypeError(f"숫자형 컬럼만 계산할 수 있다: {name!r} ({df[name].dtype})")
+        return df[names]
 
     def _get_table(self, name: str) -> pd.DataFrame:
         """테이블 이름으로 DataFrame을 돌려준다. 읽기 전이거나 이름이 틀리면 오류를 낸다."""
