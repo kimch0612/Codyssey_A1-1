@@ -97,3 +97,32 @@ class DataAnalyzer:
             parse_dates=self.ARTICLES_DATE_COLUMNS,
         )
         return self
+
+    def add_text_features(self, text_col: str = "prod_name") -> "DataAnalyzer":
+        """텍스트 컬럼에서 단어 수와 문자열 길이를 계산해 상품 테이블에 새 컬럼으로 추가한다.
+
+        추가되는 컬럼(원본 컬럼은 바꾸지 않는다):
+            - `{text_col}_word_count`: 단어 수. 공백(연속된 공백은 하나로 본다)으로
+              나눈 조각의 개수이며, 구두점은 정리하지 않는다. 예: "Tilly (1)" -> 2
+            - `{text_col}_length`: 문자열 길이. 공백을 포함한 글자 수다.
+
+        값이 비어 있는(결측) 행은 두 컬럼도 결측으로 남긴다(0으로 채우지 않는다).
+        pandas 문자열 메서드로 컬럼 전체를 한 번에 계산하며 Python 반복문을 쓰지 않는다.
+
+        Args:
+            text_col: 계산 대상 텍스트 컬럼 이름. 기본값은 상품명 `prod_name`.
+
+        Returns:
+            self. 같은 컬럼을 다시 계산하면 덮어쓴다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+        """
+        if self.articles is None:
+            raise RuntimeError("load_data()를 먼저 호출해야 한다.")
+
+        text = self.articles[text_col]
+        # str.split()은 인자 없이 쓰면 공백 연속을 하나의 구분자로 본다.
+        self.articles[f"{text_col}_word_count"] = text.str.split().str.len()
+        self.articles[f"{text_col}_length"] = text.str.len()
+        return self
