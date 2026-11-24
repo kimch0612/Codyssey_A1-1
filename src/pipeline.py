@@ -268,6 +268,93 @@ class DataAnalyzer:
         df[target_col] = column.fillna(fill_values)
         return self
 
+    def iqr_bounds(
+        self, table: str, column: str, threshold: float = 1.5
+    ) -> Tuple[float, float]:
+        """IQR 방식의 이상치 경계를 계산한다.
+
+        데이터를 작은 값부터 줄 세웠을 때 1/4 지점의 값이 Q1, 3/4 지점의 값이 Q3이고
+        IQR = Q3 - Q1이다. 경계는 다음과 같다(결측은 계산에서 제외한다).
+            - 아래 경계 = Q1 - threshold * IQR
+            - 위 경계   = Q3 + threshold * IQR
+
+        Args:
+            table: 대상 테이블 이름. "transactions", "customers", "articles" 중 하나.
+            column: 숫자 컬럼.
+            threshold: IQR에 곱하는 임계값. 0 이상의 수. 클수록 경계가 넓어진다.
+
+        Returns:
+            (아래 경계, 위 경계). 컬럼 전체가 결측이면 둘 다 NaN이다.
+
+        Raises:
+            RuntimeError: `load_data()`를 호출하기 전일 때.
+            ValueError: 알 수 없는 table이거나 threshold가 0 이상의 유한한 수가 아닐 때.
+            TypeError: column이 숫자형이 아닐 때.
+        """
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not np.isfinite(threshold)
+            or threshold < 0
+        ):
+            raise ValueError(f"threshold는 0 이상의 유한한 수여야 한다: {threshold!r}")
+        values = self._get_table(table)[column]
+        if not pd.api.types.is_numeric_dtype(values):
+            raise TypeError(f"숫자형 컬럼만 계산할 수 있다: {column!r} ({values.dtype})")
+
+        q1 = values.quantile(0.25)
+        q3 = values.quantile(0.75)
+        iqr = q3 - q1
+        return float(q1 - threshold * iqr), float(q3 + threshold * iqr)
+
+    def detect_outliers(
+        self, table: str, column: str, threshold: float = 1.5
+    ) -> pd.DataFrame:
+        """IQR 경계 밖에 있는 값을 가진 행을 찾아 반환한다.
+
+        `값 < 아래 경계` 또는 `값 > 위 경계`인 행만 이상치다. 경계와 같은 값은 이상치가
+        아니다. 결측은 이상치로 보지 않는다. 테이블은 바꾸지 않는다.
+
+        Args:
+            table: 대상 테이블 이름.
+            column: 숫자 컬럼.
+            threshold: IQR에 곱하는 임계값(기본 1.5).
+
+        Returns:
+            이상치 행들의 DataFrame(원래 행 번호를 유지한다). 이상치가 없으면 빈 표다.
+
+        Raises:
+            `iqr_bounds()`와 같다.
+        """
+        lower, upper = self.iqr_bounds(table, column, threshold)
+        df = self._get_table(table)
+        values = df[column]
+        return df[(values < lower) | (values > upper)]
+
+    def treat_outliers(
+        self, table: str, column: str, threshold: float = 1.5
+    ) -> "DataAnalyzer":
+        """이상치를 경계값으로 대체한 값을 새 컬럼 `{column}_clipped`에 저장한다.
+
+        경계 밖의 값은 가까운 쪽 경계값으로 바꾸고, 경계 안의 값은 그대로 둔다. 행은
+        지우지 않는다. 원본 컬럼은 바꾸지 않으므로 처리 전후를 비교할 수 있다.
+
+        Args:
+            table: 대상 테이블 이름.
+            column: 숫자 컬럼.
+            threshold: IQR에 곱하는 임계값(기본 1.5).
+
+        Returns:
+            self. 다시 호출하면 `{column}_clipped`를 덮어쓴다.
+
+        Raises:
+            `iqr_bounds()`와 같다.
+        """
+        lower, upper = self.iqr_bounds(table, column, threshold)
+        df = self._get_table(table)
+        df[f"{column}_clipped"] = df[column].clip(lower=lower, upper=upper)
+        return self
+
     def _get_table(self, name: str) -> pd.DataFrame:
         """테이블 이름으로 DataFrame을 돌려준다. 읽기 전이거나 이름이 틀리면 오류를 낸다."""
         if name not in self.TABLE_NAMES:
