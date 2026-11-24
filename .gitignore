@@ -6,3 +6,5 @@ Evaluate.txt
 
 data/
 .venv/
+
+__pycache__/
